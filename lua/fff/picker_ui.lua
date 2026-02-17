@@ -40,7 +40,9 @@ local function get_border_chars()
   return BORDER_PRESETS.single, T_JUNCTION_PRESETS.single
 end
 
-local function get_prompt_position()
+--- Resolve the raw user-configured prompt_position (ignoring any vertical-layout forcing).
+--- Used by compute_layout_and_borders() before the forcing decision is made.
+local function get_raw_prompt_position()
   local config = M.state.config
 
   if config and config.layout and config.layout.prompt_position then
@@ -60,21 +62,39 @@ local function get_prompt_position()
   return 'bottom'
 end
 
+--- Get the effective prompt position. Returns the forced value (stored in state)
+--- when the picker is active, so rendering, cursor movement, scrollbar, and pagination
+--- all stay consistent with the actual window layout.
+local function get_prompt_position()
+  if M.state.prompt_position then return M.state.prompt_position end
+  return get_raw_prompt_position()
+end
+
 local function get_preview_position()
   local config = M.state.config
+  local terminal_width = vim.o.columns
+  local terminal_height = vim.o.lines
 
   if config and config.layout and config.layout.preview_position then
-    local terminal_width = vim.o.columns
-    local terminal_height = vim.o.lines
-
-    return utils.resolve_config_value(
+    local raw = utils.resolve_config_value(
       config.layout.preview_position,
       terminal_width,
       terminal_height,
-      function(value) return utils.is_one_of(value, { 'left', 'right', 'top', 'bottom' }) end,
-      'right',
+      function(value) return utils.is_one_of(value, { 'auto', 'left', 'right', 'top', 'bottom' }) end,
+      'auto',
       'layout.preview_position'
     )
+
+    if raw == 'auto' then
+      local width_ratio = utils.resolve_config_value(
+        config.layout.width, terminal_width, terminal_height,
+        utils.is_valid_ratio, 0.8, 'layout.width'
+      )
+      local picker_width = math.floor(terminal_width * width_ratio)
+      return picker_width < 120 and 'bottom' or 'right'
+    end
+
+    return raw
   end
 
   return 'right'
@@ -348,14 +368,11 @@ M.state = {
   suggestion_source = nil,
 }
 
-function M.create_ui()
+--- Compute layout dimensions and border arrays for all picker windows.
+--- Reused by create_ui() (initial open) and handle_resize() (reposition in-place).
+--- @return table geom Table with layout, prompt_position, preview_position, and per-window border/title fields
+local function compute_layout_and_borders()
   local config = M.state.config
-
-  if not M.state.ns_id then
-    M.state.ns_id = vim.api.nvim_create_namespace('fff_picker_status')
-    combo_renderer.init(M.state.ns_id)
-  end
-
   local debug_enabled_in_preview = M.enabled_preview() and config and config.debug and config.debug.show_file_info
 
   local terminal_width = vim.o.columns
@@ -415,8 +432,18 @@ function M.create_ui()
   local col = math.floor(terminal_width * col_ratio)
   local row = math.floor(terminal_height * row_ratio)
 
-  local prompt_position = get_prompt_position()
+  local prompt_position = get_raw_prompt_position()
   local preview_position = get_preview_position()
+
+  -- Force prompt to opposite side of preview for vertical layouts
+  -- so the results panel is always sandwiched between input and preview
+  if M.enabled_preview() then
+    if preview_position == 'bottom' then
+      prompt_position = 'top'
+    elseif preview_position == 'top' then
+      prompt_position = 'bottom'
+    end
+  end
 
   local preview_size_ratio = utils.resolve_config_value(
     config.layout.preview_size,
@@ -442,7 +469,85 @@ function M.create_ui()
   }
 
   local layout = M.calculate_layout_dimensions(layout_config)
+
+  -- Build border arrays and titles for each window
+  local border_chars, t_junctions = get_border_chars()
+  local title = ' ' .. (M.state.config.title or 'FFFiles') .. ' '
+
+  -- List border: connected to adjacent panels via T-junctions
+  local list_border = (M.enabled_preview() and (preview_position == 'top' or preview_position == 'bottom'))
+      and { t_junctions[1], border_chars[2], t_junctions[2], border_chars[4], '', '', '', border_chars[8] }
+    or (prompt_position == 'bottom'
+      and { border_chars[1], border_chars[2], border_chars[3], border_chars[4], '', '', '', border_chars[8] }
+      or {
+        t_junctions[1],
+        border_chars[2],
+        t_junctions[2],
+        border_chars[4],
+        border_chars[5],
+        border_chars[6],
+        border_chars[7],
+        border_chars[8],
+      })
+
+  -- Title goes on the topmost window in the stack
+  local list_title = nil
+  if prompt_position == 'bottom' and preview_position ~= 'top' then list_title = title end
+
+  -- Input border: connected to list via T-junctions
+  local input_border = prompt_position == 'bottom'
+      and {
+        t_junctions[1],
+        border_chars[2],
+        t_junctions[2],
+        border_chars[4],
+        border_chars[5],
+        border_chars[6],
+        border_chars[7],
+        border_chars[8],
+      }
+    or { border_chars[1], border_chars[2], border_chars[3], border_chars[4], '', '', '', border_chars[8] }
+  local input_title = nil
+  if prompt_position == 'top' then input_title = title end
+
+  -- Preview border: connected to list for vertical layouts
+  local preview_border = border_chars
+  local preview_title = ' Preview '
+  if preview_position == 'bottom' then
+    preview_border = { t_junctions[1], border_chars[2], t_junctions[2], border_chars[4], border_chars[5], border_chars[6], border_chars[7], border_chars[8] }
+  elseif preview_position == 'top' then
+    preview_border = { border_chars[1], border_chars[2], border_chars[3], border_chars[4], '', '', '', border_chars[8] }
+    preview_title = title
+  end
+
+  return {
+    layout = layout,
+    prompt_position = prompt_position,
+    preview_position = preview_position,
+    list_border = list_border,
+    list_title = list_title,
+    input_border = input_border,
+    input_title = input_title,
+    preview_border = preview_border,
+    preview_title = preview_title,
+    file_info_border = border_chars,
+  }
+end
+
+function M.create_ui()
+  local config = M.state.config
+
+  if not M.state.ns_id then
+    M.state.ns_id = vim.api.nvim_create_namespace('fff_picker_status')
+    combo_renderer.init(M.state.ns_id)
+  end
+
+  local geom = compute_layout_and_borders()
+  local layout = geom.layout
   M.state.layout = layout
+  M.state.prompt_position = geom.prompt_position
+
+  local debug_enabled_in_preview = M.enabled_preview() and config and config.debug and config.debug.show_file_info
 
   M.state.input_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_option(M.state.input_buf, 'bufhidden', 'wipe')
@@ -462,42 +567,23 @@ function M.create_ui()
     M.state.file_info_buf = nil
   end
 
-  local border_chars, t_junctions = get_border_chars()
+  -- Open list window
   local list_window_config = {
     relative = 'editor',
     width = layout.list_width,
     height = layout.list_height,
     col = layout.list_col,
     row = layout.list_row,
-    -- To make the input feel connected with the picker, we customize the
-    -- respective corner border characters based on prompt_position
-    -- When prompt at bottom: list has top border + sides, no bottom (connects to input below)
-    -- When prompt at top: list has sides + bottom with T-junctions at top (connects to input above)
-    border = prompt_position == 'bottom'
-        and { border_chars[1], border_chars[2], border_chars[3], border_chars[4], '', '', '', border_chars[8] }
-      or {
-        t_junctions[1],
-        border_chars[2],
-        t_junctions[2],
-        border_chars[4],
-        border_chars[5],
-        border_chars[6],
-        border_chars[7],
-        border_chars[8],
-      },
+    border = geom.list_border,
     style = 'minimal',
   }
-
-  local title = ' ' .. (M.state.config.title or 'FFFiles') .. ' '
-  -- Only add title if prompt is at bottom - when prompt is top, title should be on input
-  if prompt_position == 'bottom' then
-    list_window_config.title = title
+  if geom.list_title then
+    list_window_config.title = geom.list_title
     list_window_config.title_pos = 'left'
   end
-
   M.state.list_win = vim.api.nvim_open_win(M.state.list_buf, false, list_window_config)
 
-  -- Create file info window if debug enabled
+  -- Open file info window if debug enabled
   if debug_enabled_in_preview and layout.file_info then
     M.state.file_info_win = vim.api.nvim_open_win(M.state.file_info_buf, false, {
       relative = 'editor',
@@ -506,7 +592,7 @@ function M.create_ui()
       col = layout.file_info.col,
       row = layout.file_info.row,
       style = 'minimal',
-      border = border_chars,
+      border = geom.file_info_border,
       title = ' File Info ',
       title_pos = 'left',
     })
@@ -514,7 +600,7 @@ function M.create_ui()
     M.state.file_info_win = nil
   end
 
-  -- Create preview window
+  -- Open preview window
   if M.enabled_preview() and layout.preview then
     M.state.preview_win = vim.api.nvim_open_win(M.state.preview_buf, false, {
       relative = 'editor',
@@ -523,40 +609,26 @@ function M.create_ui()
       col = layout.preview.col,
       row = layout.preview.row,
       style = 'minimal',
-      border = border_chars,
-      title = ' Preview ',
+      border = geom.preview_border,
+      title = geom.preview_title,
       title_pos = 'left',
     })
   end
 
+  -- Open input window
   local input_window_config = {
     relative = 'editor',
     width = layout.input_width,
     height = 1,
     col = layout.input_col,
     row = layout.input_row,
-    -- To make the input feel connected with the picker, we customize the
-    -- respective corner border characters based on prompt_position
-    -- if prompt at bottom: input has T-junctions at top (connects to list above), full bottom border
-    -- if prompt at top: input has top border + sides, no bottom (connects to list below)
-    border = prompt_position == 'bottom' and {
-      t_junctions[1],
-      border_chars[2],
-      t_junctions[2],
-      border_chars[4],
-      border_chars[5],
-      border_chars[6],
-      border_chars[7],
-      border_chars[8],
-    } or { border_chars[1], border_chars[2], border_chars[3], border_chars[4], '', '', '', border_chars[8] },
+    border = geom.input_border,
     style = 'minimal',
   }
-
-  if prompt_position == 'top' then
-    input_window_config.title = title
+  if geom.input_title then
+    input_window_config.title = geom.input_title
     input_window_config.title_pos = 'left'
   end
-
   M.state.input_win = vim.api.nvim_open_win(M.state.input_buf, false, input_window_config)
 
   M.setup_buffers()
@@ -572,6 +644,90 @@ function M.create_ui()
   M.update_status()
 
   return true
+end
+
+--- Recompute layout and reposition all picker windows in-place after terminal resize.
+--- Uses nvim_win_set_config() to avoid flicker and preserve buffer content, cursor, insert mode.
+function M.handle_resize()
+  if not M.state.active then return end
+
+  -- Bail if any core picker window is invalid
+  for _, win in ipairs({ M.state.input_win, M.state.list_win }) do
+    if not win or not vim.api.nvim_win_is_valid(win) then return end
+  end
+
+  -- Recompute layout from current terminal dimensions
+  local geom = compute_layout_and_borders()
+  local layout = geom.layout
+
+  -- Close picker if terminal is too small for a viable UI
+  if layout.list_width < 10 or layout.list_height < 3 then
+    M.close()
+    return
+  end
+
+  -- Update state
+  M.state.layout = layout
+  M.state.prompt_position = geom.prompt_position
+
+  -- Reposition list window
+  vim.api.nvim_win_set_config(M.state.list_win, {
+    relative = 'editor',
+    width = layout.list_width,
+    height = layout.list_height,
+    col = layout.list_col,
+    row = layout.list_row,
+    border = geom.list_border,
+    title = geom.list_title or '',
+    title_pos = geom.list_title and 'left' or nil,
+  })
+
+  -- Reposition input window
+  vim.api.nvim_win_set_config(M.state.input_win, {
+    relative = 'editor',
+    width = layout.input_width,
+    height = 1,
+    col = layout.input_col,
+    row = layout.input_row,
+    border = geom.input_border,
+    title = geom.input_title or '',
+    title_pos = geom.input_title and 'left' or nil,
+  })
+
+  -- Reposition preview window
+  if M.state.preview_win and vim.api.nvim_win_is_valid(M.state.preview_win) and layout.preview then
+    vim.api.nvim_win_set_config(M.state.preview_win, {
+      relative = 'editor',
+      width = layout.preview.width,
+      height = layout.preview.height,
+      col = layout.preview.col,
+      row = layout.preview.row,
+      border = geom.preview_border,
+      title = geom.preview_title or '',
+      title_pos = geom.preview_title and 'left' or nil,
+    })
+  end
+
+  -- Reposition file info window
+  if M.state.file_info_win and vim.api.nvim_win_is_valid(M.state.file_info_win) and layout.file_info then
+    vim.api.nvim_win_set_config(M.state.file_info_win, {
+      relative = 'editor',
+      width = layout.file_info.width,
+      height = layout.file_info.height,
+      col = layout.file_info.col,
+      row = layout.file_info.row,
+    })
+  end
+
+  -- Update page_size since list height may have changed
+  M.state.pagination.page_size = vim.api.nvim_win_get_height(M.state.list_win)
+
+  -- Re-render (updates scrollbar, combo overlays, padding)
+  M.render_list()
+
+  -- Force status re-render
+  M.state.last_status_info = nil
+  M.update_status()
 end
 
 function M.setup_buffers()
@@ -682,6 +838,16 @@ function M.setup_windows()
       end)
     end,
     desc = 'Close picker when focus leaves picker windows',
+  })
+
+  vim.api.nvim_create_autocmd('VimResized', {
+    group = picker_group,
+    callback = function()
+      vim.schedule(function()
+        M.handle_resize()
+      end)
+    end,
+    desc = 'Resize picker when terminal dimensions change',
   })
 end
 
@@ -2338,6 +2504,7 @@ function M.close()
   M.state.grep_regex_fallback_error = nil
   M.state.suggestion_items = nil
   M.state.suggestion_source = nil
+  M.state.prompt_position = nil
   M.state.combo_visible = true
   M.state.combo_initial_cursor = nil
   M.reset_history_state()
